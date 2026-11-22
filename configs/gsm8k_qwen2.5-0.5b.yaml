@@ -1,0 +1,21 @@
+# Paper section 4.2 setting (Qwen2.5-0.5B, GSM8K). Change the rollout precision and the correction
+# from the command line, e.g. --set rollout_quant=int8 correction=none
+model: qwen2.5-0.5b-instruct
+dataset: gsm8k
+rollout_quant: bf16          # bf16 | fp8 | int8
+correction: tis              # none | tis | ppo_is | vanilla_is
+tis_cap: 2.0
+steps: 400                   # upper bound; converge_patience usually stops it earlier
+prompts_per_step: 64
+samples_per_prompt: 8
+max_new_tokens: 512
+lr: 1.0e-6
+clip_low: 0.2
+clip_high: 0.2
+ppo_minibatches: 4
+eval_every: 10
+eval_limit: 500
+profile_every: 1             # CUPTI summary for every step
+trace_steps: [2]             # plus a full Chrome trace of step 2
+converge_patience: 5         # stop when eval accuracy has not improved for 5 evals
+min_steps: 50

@@ -1,0 +1,19 @@
+# MATH (hendrycks train) -> MATH-500 eval with a 1.5B instruct model.
+model: qwen2.5-1.5b-instruct
+dataset: math
+rollout_quant: bf16
+correction: tis
+steps: 100
+prompts_per_step: 32
+samples_per_prompt: 8
+max_new_tokens: 1024
+lr: 1.0e-6
+ppo_minibatches: 2
+eval_every: 25
+eval_limit: 500
+vllm_gpu_memory_utilization: 0.35
+micro_batch_tokens: 16384
+profile_every: 1             # CUPTI summary for every step
+trace_steps: [2]             # plus a full Chrome trace of step 2
+converge_patience: 4         # stop when eval accuracy has not improved for 4 evals
+min_steps: 50

@@ -1,0 +1,23 @@
+# DAPO-style recipe (paper section 4.1, scaled down): DAPO-Math-17k -> AIME 2024, clip-higher,
+# token-mean loss, dynamic-sampling-like filtering of uniform groups.
+model: qwen2.5-math-1.5b-instruct
+dataset: dapo_math
+rollout_quant: bf16
+correction: tis
+steps: 100
+prompts_per_step: 32
+samples_per_prompt: 16
+max_prompt_tokens: 512
+max_new_tokens: 2048
+lr: 1.0e-6
+clip_low: 0.2
+clip_high: 0.28
+ppo_minibatches: 2
+eval_every: 25
+eval_limit: 0
+eval_max_new_tokens: 3072
+vllm_gpu_memory_utilization: 0.35
+profile_every: 1             # CUPTI summary for every step
+trace_steps: [2]             # plus a full Chrome trace of step 2
+converge_patience: 4         # stop when eval accuracy has not improved for 4 evals
+min_steps: 50

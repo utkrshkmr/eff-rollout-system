@@ -1,0 +1,6 @@
+.venv/
+workdir/
+report/
+__pycache__/
+*.egg-info/
+*.pyc

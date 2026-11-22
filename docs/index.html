@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RL Rollout Profiling</title>
+<meta name="description" content="CUPTI profiles of every step of an RL fine-tuning loop (vLLM rollouts, FSDP2 training) and the rollout-training mismatch.">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1d1d1b; --muted: #6a6a64; --line: #e2e1dc; --card: #ffffff;
+    --accent: #2f6fb0; --code: #f1f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161615; --fg: #e9e8e3; --muted: #a3a29b; --line: #34332f; --card: #1e1e1c;
+      --accent: #7fb2e5; --code: #2a2a27;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161615; --fg: #e9e8e3; --muted: #a3a29b; --line: #34332f; --card: #1e1e1c;
+    --accent: #7fb2e5; --code: #2a2a27;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 26px; margin: 8px 0 4px; }
+  h2 { font-size: 19px; margin: 36px 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  h3 { font-size: 15px; margin: 20px 0 6px; }
+  p, li { color: var(--fg); }
+  .muted { color: var(--muted); }
+  a { color: var(--accent); }
+  code { background: var(--code); padding: 1px 4px; border-radius: 3px; font-size: 13px; }
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+  .card h3 { margin-top: 2px; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  td.name { text-align: left; max-width: 520px; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  ol.flow li { margin: 3px 0; }
+  select { font: inherit; padding: 3px 6px; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+  canvas { max-width: 100%; }
+  img { max-width: 100%; height: auto; background: #fff; border-radius: 4px; }
+  #empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+<h1>RL fine-tuning, profiled with CUPTI</h1>
+<p class="muted">vLLM rollouts + FSDP2 training on one GPU, every step traced with the CUDA Profiling Tools Interface;
+a study of the rollout-training mismatch of Yao, Liu, Zhang, Dong, Shang and Gao, "On the Rollout-Training
+Mismatch in Modern RL Systems" (NeurIPS 2025 Efficient Reasoning workshop).</p>
+
+<h2>What the implementation does</h2>
+<p>An instruction-tuned (SFT) model is fine-tuned with reinforcement learning on a math or puzzle dataset with
+rule-based rewards. As in production RL frameworks it uses two engines with the same weights: <b>vLLM</b> generates the
+rollouts and <b>PyTorch FSDP2</b> computes gradients. Both run in one process on one GPU, so a single CUPTI session
+sees every kernel. Each training step is split into named phases:</p>
+<ol class="flow">
+  <li><b>weight_sync</b>: FSDP parameters are gathered and cast to bf16 (<code>gather</code>), quantized to INT8 for INT8
+      rollouts (<code>quantize</code>), and loaded into vLLM with its layer-wise reload (<code>vllm_load</code>).</li>
+  <li><b>rollout</b>: vLLM samples <i>n</i> responses per prompt and returns log&nbsp;π<sub>vllm</sub>(token) for every
+      sampled token (processed logprobs, i.e. the true sampling distribution).</li>
+  <li><b>reward</b>: answers are checked (math-verify for math, exact equation check for Countdown); CPU only.</li>
+  <li><b>advantage</b>: group-normalized advantages (reward minus the prompt's mean, divided by its std); groups whose
+      samples all got the same reward are dropped.</li>
+  <li><b>old_logprob</b>: the FSDP model re-scores every rollout without gradients: log&nbsp;π<sub>fsdp</sub>(θ<sub>old</sub>)
+      and the policy entropy.</li>
+  <li><b>mismatch</b>: π<sub>vllm</sub> vs π<sub>fsdp</sub> on the same tokens and the same weights: KL estimates,
+      |p<sub>vllm</sub> − p<sub>fsdp</sub>|, importance-ratio extremes, and a 2-D histogram (the paper's Figure 1, left).</li>
+  <li><b>train</b>: PPO-clip loss over mini-batches (<code>forward</code>, <code>backward</code>, <code>optimizer</code>),
+      with one of four corrections: <code>none</code> (ignore the mismatch), <code>tis</code> (truncated importance
+      sampling, weight min(π<sub>fsdp</sub>/π<sub>vllm</sub>, C)), <code>ppo_is</code> (π<sub>vllm</sub> in the PPO ratio),
+      <code>vanilla_is</code> (untruncated weight).</li>
+</ol>
+<p>Rollouts can run in <b>bf16</b>, <b>FP8</b> (vLLM online quantization; weight-only Marlin kernels on A100) or
+<b>INT8 W8A8</b> (Cutlass INT8 GEMMs, per-channel weights, per-token activations). The profiler uses NVIDIA's
+<code>cupti-python</code> Activity API: kernels, memcpys, memsets and CUDA runtime/driver calls are recorded and each
+is assigned to the phase that launched it via CUPTI external correlation ids, with a time-window fallback for work
+launched from other threads (the autograd backward thread). Phases are bracketed by device synchronizations, so the
+wall time and the GPU-busy time of a phase can be compared directly. Training continues until the evaluation accuracy
+stops improving (no gain for several evaluations in a row) or a step limit is reached.</p>
+
+<h2>Runs</h2>
+<p id="setup" class="muted"></p>
+<p id="empty" class="muted">No runs in data/runs.json yet. Build it with <code>python scripts/08_build_site.py</code>.</p>
+<div class="tablewrap"><table id="runs"></table></div>
+
+<h2>Learning and mismatch over training</h2>
+<div class="grid">
+  <div class="card"><h3>Eval accuracy (greedy)</h3><canvas id="c_eval"></canvas></div>
+  <div class="card"><h3>Train reward</h3><canvas id="c_reward"></canvas></div>
+  <div class="card"><h3>KL(π<sub>vllm</sub> ‖ π<sub>fsdp</sub>), k3 estimator</h3><canvas id="c_kl"></canvas></div>
+  <div class="card"><h3>Mean |p<sub>vllm</sub> − p<sub>fsdp</sub>| per token</h3><canvas id="c_dp"></canvas></div>
+  <div class="card"><h3>Policy entropy</h3><canvas id="c_ent"></canvas></div>
+  <div class="card"><h3>Step time (s)</h3><canvas id="c_step"></canvas></div>
+</div>
+
+<h2>CUPTI profile of every step</h2>
+<p>Run: <select id="runsel"></select></p>
+<div class="grid">
+  <div class="card"><h3>Wall time per phase, every step (ms)</h3><canvas id="c_phase"></canvas></div>
+  <div class="card"><h3>GPU busy fraction per phase, every step</h3><canvas id="c_busy"></canvas></div>
+</div>
+<h3>Phase totals averaged over all profiled steps</h3>
+<div class="tablewrap"><table id="phasetab"></table></div>
+<h3>GPU kernel time by category, averaged per step (ms)</h3>
+<div class="tablewrap"><table id="cattab"></table></div>
+<h3 id="toptitle">Top kernels</h3>
+<div class="tablewrap"><table id="toptab"></table></div>
+<h3>Token probabilities in the two engines</h3>
+<p class="muted">Density of (p<sub>vllm</sub>, p<sub>fsdp</sub>) for the sampled tokens at the first and last step;
+mass off the diagonal is the mismatch.</p>
+<div id="probs"></div>
+
+<h2>Reproduce</h2>
+<pre>bash scripts/00_create_env.sh && source .venv/bin/activate
+python scripts/01_check_env.py
+python scripts/02_download_models.py --models qwen2.5-0.5b-instruct
+python scripts/03_prepare_data.py --datasets gsm8k
+python scripts/04_make_int8_checkpoint.py --model qwen2.5-0.5b-instruct     # INT8 rollouts only
+python scripts/06_train.py --config configs/gsm8k_qwen2.5-0.5b.yaml --set rollout_quant=int8 correction=tis
+python scripts/08_build_site.py                                              # refresh this page</pre>
+<p class="muted">Source: the repository this page is served from. Timings depend on the GPU and on other jobs sharing it.</p>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const PHASES = ["weight_sync/vllm_wake_weights", "weight_sync/gather", "weight_sync/quantize", "weight_sync/vllm_load",
+  "weight_sync/vllm_wake_kv_cache", "rollout", "vllm_sleep", "reward", "advantage", "old_logprob", "mismatch",
+  "train/forward", "train/backward", "train/optimizer"];
+const COLORS = ["#2f6fb0", "#d0743c", "#3f9d5a", "#b8443f", "#7b5ea7", "#8c6d4f", "#d17fb5", "#7f7f7f", "#b5b03a",
+  "#3aa9b5", "#1f3f73", "#a35a1c", "#26683a", "#6d2622"];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const charts = {};
+function chart(id, datasets, opts = {}) {
+  if (charts[id]) charts[id].destroy();
+  Chart.defaults.color = css("--muted"); Chart.defaults.borderColor = css("--line");
+  charts[id] = new Chart(document.getElementById(id), {
+    type: "line", data: { datasets },
+    options: Object.assign({ animation: false, parsing: false, normalized: true, responsive: true,
+      elements: { point: { radius: 0 }, line: { borderWidth: 1.5 } },
+      interaction: { mode: "nearest", intersect: false },
+      plugins: { legend: { labels: { boxWidth: 10, font: { size: 10 } } } },
+      scales: { x: { type: "linear", title: { display: true, text: "step" } }, y: opts.y || {} } }, opts.extra || {})
+  });
+}
+const series = (run, key) => run.steps.filter(s => s[key] != null).map(s => ({ x: s.step, y: s[key] }));
+const fmt = (x, d = 1) => x == null || isNaN(x) ? "" : Number(x).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const mean = a => a.length ? a.reduce((p, c) => p + c, 0) / a.length : NaN;
+const label = r => `${r.cfg.rollout_quant} / ${r.cfg.correction}` + (r.cfg.model !== "qwen2.5-0.5b-instruct" || r.cfg.dataset !== "gsm8k" ? ` (${r.cfg.model}, ${r.cfg.dataset})` : "");
+
+fetch("data/runs.json").then(r => r.json()).then(({ runs }) => {
+  if (!runs.length) { document.getElementById("empty").style.display = "block"; return; }
+  const r0 = runs[0];
+  document.getElementById("setup").textContent = `GPU: ${r0.init.gpu || "?"}. Model ${r0.cfg.model}, dataset ${r0.cfg.dataset}; `
+    + `${r0.cfg.prompts_per_step} prompts × ${r0.cfg.samples_per_prompt} samples per step, up to ${r0.cfg.max_new_tokens} new tokens, `
+    + `lr ${r0.cfg.lr}, TIS cap C = ${r0.cfg.tis_cap}, ${r0.cfg.ppo_minibatches} PPO mini-batches per step, eval on ${r0.evals[0] ? r0.evals[0].n : "?"} test problems every ${r0.cfg.eval_every} steps.`;
+  // runs table
+  let h = "<tr><th>run</th><th>rollout</th><th>correction</th><th>steps</th><th>stopped</th><th>eval acc: start</th><th>best</th><th>final</th><th>mean KL k3</th><th>mean |Δp|</th><th>median step s</th><th>rollout tok/s</th></tr>";
+  for (const r of runs) {
+    const acc = r.evals.map(e => e.acc), st = r.steps.map(s => s.step_s).sort((a, b) => a - b);
+    h += `<tr><td>${r.name}</td><td>${r.cfg.rollout_quant}</td><td>${r.cfg.correction}</td><td>${r.steps.length}</td>`
+      + `<td>${r.end ? r.end.stop_reason : "running"}</td><td>${fmt(acc[0], 3)}</td><td>${fmt(Math.max(...acc), 3)}</td><td>${fmt(acc[acc.length - 1], 3)}</td>`
+      + `<td>${mean(r.steps.map(s => s.kl_k3)).toExponential(2)}</td><td>${fmt(mean(r.steps.map(s => s.prob_absdiff_mean)), 4)}</td>`
+      + `<td>${fmt(st[Math.floor(st.length / 2)], 1)}</td><td>${fmt(mean(r.steps.map(s => s.rollout_tok_per_s)), 0)}</td></tr>`;
+  }
+  document.getElementById("runs").innerHTML = h;
+  const ds = (key, src) => runs.map((r, i) => ({ label: label(r), borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i % COLORS.length],
+    data: src ? r.evals.map(e => ({ x: e.step, y: e.acc })) : series(r, key) }));
+  chart("c_eval", ds(null, true).map(d => Object.assign(d, { pointRadius: 2 })));
+  chart("c_reward", ds("reward_mean"));
+  chart("c_kl", ds("kl_k3"), { y: { type: "logarithmic" } });
+  chart("c_dp", ds("prob_absdiff_mean"));
+  chart("c_ent", ds("entropy_mean"));
+  chart("c_step", ds("step_s"));
+
+  const sel = document.getElementById("runsel");
+  runs.forEach((r, i) => sel.add(new Option(`${r.name} (${label(r)})`, i)));
+  sel.onchange = () => showRun(runs[sel.value]);
+  showRun(runs[0]);
+});
+
+function showRun(r) {
+  const prof = r.steps.filter(s => s.cupti);
+  const present = PHASES.filter(p => prof.some(s => s.cupti[p]));
+  chart("c_phase", present.map((p, i) => ({ label: p, borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i % COLORS.length],
+    data: prof.filter(s => s.cupti[p]).map(s => ({ x: s.step, y: s.cupti[p].w })) })), { y: { type: "logarithmic" } });
+  chart("c_busy", present.filter(p => !["reward", "advantage"].includes(p)).map((p, i) => ({ label: p, borderColor: COLORS[PHASES.indexOf(p) % COLORS.length],
+    data: prof.filter(s => s.cupti[p] && s.cupti[p].w > 0).map(s => ({ x: s.step, y: s.cupti[p].b / s.cupti[p].w })) })), { y: { min: 0, max: 1 } });
+  // phase table
+  let h = "<tr><th>phase</th><th>wall ms</th><th>GPU busy ms</th><th>busy %</th><th>kernels</th><th>peak mem GB</th><th>share of step wall</th></tr>";
+  const stepWall = mean(prof.map(s => present.reduce((a, p) => a + (s.cupti[p] ? s.cupti[p].w : 0), 0)));
+  for (const p of present) {
+    const v = prof.map(s => s.cupti[p]).filter(Boolean);
+    const w = mean(v.map(x => x.w)), b = mean(v.map(x => x.b));
+    h += `<tr><td>${p}</td><td>${fmt(w)}</td><td>${fmt(b)}</td><td>${fmt(100 * b / w, 0)}</td><td>${fmt(mean(v.map(x => x.k)), 0)}</td>`
+      + `<td>${fmt(Math.max(...v.map(x => x.m)), 2)}</td><td>${fmt(100 * w / stepWall, 1)}%</td></tr>`;
+  }
+  document.getElementById("phasetab").innerHTML = h;
+  // category table
+  const cats = {};
+  for (const p of present) for (const s of prof) if (s.cupti[p]) for (const [c, ms] of Object.entries(s.cupti[p].c)) cats[c] = (cats[c] || 0) + ms;
+  const catList = Object.keys(cats).sort((a, b) => cats[b] - cats[a]);
+  h = "<tr><th>phase</th>" + catList.map(c => `<th>${c}</th>`).join("") + "</tr>";
+  for (const p of present) {
+    const v = prof.map(s => s.cupti[p]).filter(Boolean);
+    if (!v.some(x => x.k)) continue;
+    h += `<tr><td>${p}</td>` + catList.map(c => `<td>${fmt(mean(v.map(x => x.c[c] || 0)), 1)}</td>`).join("") + "</tr>";
+  }
+  document.getElementById("cattab").innerHTML = h;
+  // top kernels of the representative step
+  fetch(`data/profile_${r.name}.json`).then(x => x.ok ? x.json() : null).then(pf => {
+    const t = document.getElementById("toptab");
+    if (!pf) { t.innerHTML = ""; return; }
+    document.getElementById("toptitle").textContent = `Top kernels by GPU time in step ${r.profile_step} (full CUPTI summary)`;
+    let h = "<tr><th>phase</th><th>kernel</th><th>category</th><th>launches</th><th>ms</th></tr>";
+    for (const p of ["rollout", "old_logprob", "train/forward", "train/backward", "train/optimizer", "weight_sync/vllm_load"]) {
+      const ph = pf.phases[p]; if (!ph || !ph.top_kernels) continue;
+      for (const k of ph.top_kernels.slice(0, 4))
+        h += `<tr><td>${p}</td><td class="name" title="${k.name.replace(/"/g, "&quot;")}">${k.name.replace(/</g, "&lt;")}</td><td>${k.category}</td><td>${k.count.toLocaleString()}</td><td>${fmt(k.ms, 2)}</td></tr>`;
+    }
+    t.innerHTML = h;
+  });
+  document.getElementById("probs").innerHTML = r.probs_img ? `<img src="${r.probs_img}" alt="token probability density, ${r.name}">` : "";
+}
+</script>
+</body>
+</html>

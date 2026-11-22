@@ -1,0 +1,18 @@
+# DeepScaleR problems -> AIME 2024 with Qwen3-0.6B (non-thinking chat mode).
+model: qwen3-0.6b
+dataset: deepscaler
+rollout_quant: bf16
+correction: tis
+steps: 100
+prompts_per_step: 32
+samples_per_prompt: 8
+max_new_tokens: 1536
+lr: 1.0e-6
+ppo_minibatches: 2
+eval_every: 25
+eval_limit: 0
+vllm_gpu_memory_utilization: 0.30
+profile_every: 1             # CUPTI summary for every step
+trace_steps: [2]             # plus a full Chrome trace of step 2
+converge_patience: 4         # stop when eval accuracy has not improved for 4 evals
+min_steps: 50

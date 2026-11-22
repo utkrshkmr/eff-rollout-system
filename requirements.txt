@@ -1,0 +1,8 @@
+# Top-level dependencies. scripts/00_create_env.sh installs the fully pinned requirements.lock.txt.
+vllm==0.34.0              # brings torch 2.14.0 (CUDA 13.0), transformers, safetensors
+cupti-python>=13.0,<14    # NVIDIA CUPTI Activity API bindings; must accept the nvidia-cuda-cupti that torch pins
+datasets>=4
+math-verify>=0.8
+matplotlib
+pyyaml
+pytest

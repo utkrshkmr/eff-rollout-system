@@ -1,0 +1,13 @@
+# A few minutes end to end: checks every phase, profiler and output file.
+run_name: smoke
+model: qwen2.5-0.5b-instruct
+dataset: gsm8k
+steps: 3
+prompts_per_step: 8
+samples_per_prompt: 4
+max_new_tokens: 256
+eval_every: 3
+eval_limit: 32
+profile_every: 1
+trace_steps: [2]
+vllm_gpu_memory_utilization: 0.25
