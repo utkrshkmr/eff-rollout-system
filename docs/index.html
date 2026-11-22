@@ -116,6 +116,44 @@ stops improving (no gain for several evaluations in a row) or a step limit is re
 mass off the diagonal is the mismatch.</p>
 <div id="probs"></div>
 
+<h2>Problems found and fixed while building it</h2>
+<ul>
+  <li><b>vLLM's extensible KV cache starved the trainer.</b> vLLM 0.34 turns on an "extensible" KV cache that
+      lives outside PyTorch's allocator and calls <code>torch.cuda.set_per_process_memory_fraction</code> to cap
+      what PyTorch may reserve in the whole process. With the trainer in the same process, the 1.5B runs hit
+      out-of-memory errors at a 54.5 GiB cap on an 80 GB GPU. The rollout engine now starts with
+      <code>enable_extensible_kv_cache=False</code>, so the KV cache is an ordinary allocation sized by
+      <code>vllm_gpu_memory_utilization</code> and the rest of the GPU stays free for training.</li>
+  <li><b>vLLM tried to JIT-compile a sampling kernel with the wrong CUDA compiler.</b> vLLM's FlashInfer sampler
+      compiles CUDA code on first use with whatever <code>nvcc</code> is on <code>PATH</code>; on the build machine
+      that was CUDA 11.8, which rejects FlashInfer's flags (<code>--compress-mode=size</code>), so the run crashed.
+      The FlashInfer sampler is now off (<code>VLLM_USE_FLASHINFER_SAMPLER=0</code>) and vLLM uses its PyTorch
+      sampler, which needs no compiler and keeps sampling numerics independent of the local toolkit. All JIT and
+      compile caches (vLLM, Triton, Inductor, FlashInfer) now go under <code>RLPROF_HOME</code>.</li>
+  <li><b>Gradient checkpointing was silently off.</b> transformers' <code>from_pretrained</code> returns the model
+      in eval mode, and its gradient checkpointing only runs in train mode, so every layer's activations were
+      kept and the 1.5B runs ran out of memory in the forward pass. The trainer now calls
+      <code>model.train()</code>; the Qwen models used have no dropout, so nothing else changes.</li>
+  <li><b>The lockfile mixed two CUPTI versions.</b> <code>cupti-python</code> 13.5 requires CUPTI 13.5, while
+      torch 2.14 pins CUPTI 13.0.85, so a clean install from the lockfile could not be resolved. The lockfile now
+      pins <code>cupti-python 13.0.1</code> with <code>nvidia-cuda-cupti 13.0.85</code>; a fresh environment built
+      from it ran the full pipeline. The profiler also no longer depends on <code>cupti.get_version()</code>,
+      which only exists in cupti-python 13.2 and later.</li>
+  <li>Smaller ones: the trainer's entropy pass now uses two vocabulary-sized buffers per chunk instead of four
+      (<code>head_chunk_tokens</code>, default 2048); a run that reuses a name starts with a clean directory instead
+      of appending to the old <code>metrics.jsonl</code>; the kernel categorizer recognizes vLLM's Cutlass INT8
+      (<code>enable_sm80_to_sm89 … GemmWithVisitorIa</code>) and Marlin FP8 GEMMs by explicit rules.</li>
+</ul>
+
+<h2>Status</h2>
+<ul id="status">
+  <li><b>Runs:</b> four Qwen2.5-0.5B-Instruct / GSM8K runs (bf16 and int8 rollouts, each with TIS and with no
+      correction), about 22 s per step with CUPTI on every step. Each GPU runs TIS first, then no correction.
+      The runs table above shows each run's progress or stop reason.</li>
+  <li><b>Not measured yet:</b> how much CUPTI tracing slows a step (expected a few hundred ms for this model).</li>
+  <li><b>To do:</b> rebuild this page's data from the finished runs and republish.</li>
+</ul>
+
 <h2>Reproduce</h2>
 <pre>bash scripts/00_create_env.sh && source .venv/bin/activate
 python scripts/01_check_env.py
