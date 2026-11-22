@@ -147,9 +147,12 @@ mass off the diagonal is the mismatch.</p>
 
 <h2>Status</h2>
 <ul id="status">
-  <li><b>Runs:</b> four Qwen2.5-0.5B-Instruct / GSM8K runs (bf16 and int8 rollouts, each with TIS and with no
-      correction), about 22 s per step with CUPTI on every step. Each GPU runs TIS first, then no correction.
-      The runs table above shows each run's progress or stop reason.</li>
+  <li><b>Snapshot (2026-11-22, runs still training):</b> two of the four Qwen2.5-0.5B-Instruct / GSM8K runs are on this
+      page. bf16 rollouts + TIS: 186 steps, eval accuracy 0.486 at step 0, best 0.600 (step 160).
+      int8 rollouts + TIS: 149 steps, 0.446 at step 0, best 0.558 (step 140). About 17 s per step with CUPTI on
+      every step, on GPUs shared with other jobs.</li>
+  <li><b>Next runs:</b> the same two rollout precisions with no correction start on each GPU once its TIS run stops
+      (convergence: no eval gain for 5 evals after step 50, or 400 steps).</li>
   <li><b>Not measured yet:</b> how much CUPTI tracing slows a step (expected a few hundred ms for this model).</li>
   <li><b>To do:</b> rebuild this page's data from the finished runs and republish.</li>
 </ul>
