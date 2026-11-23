@@ -133,3 +133,9 @@ def test_entropy_path_matches_log_softmax():
     assert torch.allclose(lp, ref.gather(-1, t[:, None]).squeeze(-1), atol=1e-5)
     assert torch.allclose(ent, -(ref.exp() * ref).sum(-1), atol=1e-5)
     assert torch.allclose(_chunk_logprob(h, w, t, 1 / 0.7, False), lp, atol=1e-5)
+
+
+def test_override_keeps_string_none():
+    from rlprof.config import load_config
+    cfg = load_config("configs/gsm8k_qwen2.5-0.5b.yaml", ["correction=none", "steps=3", "lr=2e-6"])
+    assert cfg.correction == "none" and cfg.steps == 3 and cfg.lr == 2e-6

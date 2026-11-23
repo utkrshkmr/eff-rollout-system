@@ -90,6 +90,8 @@ def _coerce(cur, val: str):
         return int(val)
     if isinstance(cur, float):
         return float(val)
+    if isinstance(cur, str):  # keep strings as given: correction=none must stay "none", not None
+        return val
     if isinstance(cur, list):
         return [int(x) for x in val.split(",") if x.strip()] if val.strip() else []
     if val.lower() in ("none", "null"):
