@@ -147,14 +147,20 @@ mass off the diagonal is the mismatch.</p>
 
 <h2>Status</h2>
 <ul id="status">
-  <li><b>Snapshot (2026-11-22, runs still training):</b> two of the four Qwen2.5-0.5B-Instruct / GSM8K runs are on this
-      page. bf16 rollouts + TIS: 186 steps, eval accuracy 0.486 at step 0, best 0.600 (step 160).
-      int8 rollouts + TIS: 149 steps, 0.446 at step 0, best 0.558 (step 140). About 17 s per step with CUPTI on
-      every step, on GPUs shared with other jobs.</li>
-  <li><b>Next runs:</b> the same two rollout precisions with no correction start on each GPU once its TIS run stops
-      (convergence: no eval gain for 5 evals after step 50, or 400 steps).</li>
-  <li><b>Not measured yet:</b> how much CUPTI tracing slows a step (expected a few hundred ms for this model).</li>
-  <li><b>To do:</b> rebuild this page's data from the finished runs and republish.</li>
+  <li><b>Done (2026-11-22):</b> four Qwen2.5-0.5B-Instruct / GSM8K runs, CUPTI on every step, each stopped when eval
+      accuracy (500 test problems, every 10 steps) did not improve for 5 evals.
+      <ul>
+        <li>bf16 rollouts + TIS: 210 steps, eval 0.486 → best 0.600 (step 160).</li>
+        <li>bf16 rollouts, no correction: 130 steps, best 0.564 (step 80).</li>
+        <li>int8 rollouts + TIS: 300 steps, 0.446 → best 0.606 (step 250); KL k3 grew from 0.009 to 0.028.</li>
+        <li>int8 rollouts, no correction: 90 steps, best 0.534 (step 40), then fell to 0.480 as KL k3 grew to 0.044.
+            "Converged" here is the stop rule's name; this run was getting worse.</li>
+      </ul></li>
+  <li><b>CUPTI overhead:</b> 16.9 s per step without profiling, 20.9 s with it (+24%, both GPUs, both run orders).
+      Most of it is in the rollout (6.6 s → 9.4 s), where decoding launches many small kernels; old_logprob adds
+      0.9 s and training about 0.3 s. The phase times on this page include that overhead.</li>
+  <li><b>Not done:</b> one seed per setting; the other datasets and models in the registry were only run as short
+      smoke tests; GPUs were shared with other jobs, so timings can vary.</li>
 </ul>
 
 <h2>Reproduce</h2>

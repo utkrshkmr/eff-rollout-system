@@ -224,8 +224,12 @@ samples/*.jsonl        a few rollouts and all eval generations, with rewards
   it adds more mismatch than a calibrated checkpoint would.
 * **Memory.** The trainer computes the lm_head and log-softmax in token chunks (`head_chunk_tokens`)
   with activation checkpointing, so the full [tokens × vocab] logits never exist at once.
-* **CUPTI overhead.** A Python callback runs for each activity record, which adds a few hundred
-  milliseconds per step for the 0.5B model. Set `profile_every: 0` to time steps without it.
+* **CUPTI overhead.** Measured on an A100 80GB with Qwen2.5-0.5B on GSM8K (64 prompts × 8 samples,
+  steps 3–12 of 12-step runs, both GPUs, both run orders): a step takes 16.9 s without profiling and
+  20.9 s with CUPTI on every step, about 4 s (24%) more. Most of it is in the rollout (6.6 s → 9.4 s),
+  where decoding launches many small kernels and each one produces an activity record; old_logprob
+  adds 0.9 s and training about 0.3 s. Phase times in profiled runs therefore overstate the rollout
+  share. Set `profile_every: 0` (with `profile_steps` for a few steps) to time a run without it.
 * **Shared GPUs.** Timings depend on other jobs running on the same GPU; check `nvidia-smi` before
   comparing numbers.
 
