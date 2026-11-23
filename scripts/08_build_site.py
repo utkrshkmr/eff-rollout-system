@@ -10,6 +10,7 @@ docs/index.html is a fixed page that renders those files; serve docs/ with GitHu
 """
 import argparse
 import glob
+import gzip
 import json
 import os
 import shutil
@@ -50,6 +51,39 @@ def load(d):
     return dict(name=name, dir=d, cfg=cfg, steps=steps, evals=evals, end=end,
                 init=dict(gpu=init.get("gpu"), vllm_init_s=init.get("vllm_init_s"), policy_init_s=init.get("policy_init_s"),
                           rollout_model=init.get("rollout_model")))
+
+
+GANTT_CATS = ["gemm", "gemm_quant", "attention", "softmax_logprob", "copy_cast", "elementwise", "norm", "reduce",
+              "inductor_triton", "quantize", "sampling", "optimizer", "memcpy", "other"]
+
+
+def timeline(trace_path, out, bin_ms=5.0):
+    """Gantt data for one traced step: phase intervals and GPU time per bin and kernel category."""
+    ev = json.load(gzip.open(trace_path))["traceEvents"]
+    phases = sorted(({"n": e["name"], "t": round(e["ts"] / 1e3, 3), "d": round(e["dur"] / 1e3, 3)}
+                     for e in ev if e.get("pid") == "phases" and e.get("ph") == "X"), key=lambda p: p["t"])
+    gpu = [e for e in ev if e.get("pid") == "gpu" and e.get("ph") == "X"]
+    end = max([p["t"] + p["d"] for p in phases] + [(e["ts"] + e["dur"]) / 1e3 for e in gpu])
+    nb = int(np.ceil(end / bin_ms))
+    busy = np.zeros((len(GANTT_CATS), nb))
+    for e in gpu:
+        c = e.get("cat") or ("memcpy" if e["name"].startswith(("memcpy", "memset")) else "other")
+        ci = GANTT_CATS.index(c) if c in GANTT_CATS else GANTT_CATS.index("other")
+        t0, t1 = e["ts"] / 1e3, (e["ts"] + e["dur"]) / 1e3
+        b0, b1 = int(t0 // bin_ms), min(int(t1 // bin_ms), nb - 1)
+        if b0 == b1:
+            busy[ci, b0] += t1 - t0
+        else:  # split across bins
+            busy[ci, b0] += (b0 + 1) * bin_ms - t0
+            busy[ci, b0 + 1:b1] += bin_ms
+            busy[ci, b1] += t1 - b1 * bin_ms
+    keep = [i for i in range(len(GANTT_CATS)) if busy[i].sum() > 0]
+    data = dict(bin_ms=bin_ms, end_ms=round(end, 3), phases=phases, cats=[GANTT_CATS[i] for i in keep],
+                busy=[[round(float(x), 2) for x in busy[i]] for i in keep],
+                streams=sorted({e.get("tid") for e in gpu}))
+    with open(out, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    return out
 
 
 def probs_png(run, out):
@@ -94,6 +128,10 @@ def main():
             pick = next((p for p in prof if p.endswith("step_00002.json")), prof[0])
             shutil.copy(pick, os.path.join(DOCS, "data", f"profile_{r['name']}.json"))
             r["profile_step"] = int(os.path.basename(pick)[5:10])
+        traces = sorted(glob.glob(os.path.join(d, "profile", "trace_step_*.json.gz")))
+        if traces:
+            timeline(traces[0], os.path.join(DOCS, "data", f"timeline_{r['name']}.json"))
+            r["timeline_step"] = int(os.path.basename(traces[0])[11:16])
         if probs_png(r, os.path.join(DOCS, "img", f"probs_{r['name']}.png")):
             r["probs_img"] = f"img/probs_{r['name']}.png"
         r.pop("dir")

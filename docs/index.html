@@ -45,6 +45,11 @@
   canvas { max-width: 100%; }
   img { max-width: 100%; height: auto; background: #fff; border-radius: 4px; }
   #empty { display: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  button { font: inherit; font-size: 13px; padding: 2px 10px; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+  button.on { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -104,6 +109,26 @@ stops improving (no gain for several evaluations in a row) or a step limit is re
 <div class="grid">
   <div class="card"><h3>Wall time per phase, every step (ms)</h3><canvas id="c_phase"></canvas></div>
   <div class="card"><h3>GPU busy fraction per phase, every step</h3><canvas id="c_busy"></canvas></div>
+</div>
+<h3>Where a step's time goes: five stages by kernel category</h3>
+<p class="muted">Average over every profiled step from step 3 on. Each bar is a stage's wall time, split into GPU kernel
+time by category; the gray part is time with no kernel running (Python, CPU work, launch gaps, and CUPTI's own cost,
+which is about 2.8 s of the rollout). The other stages (weight sync, reward, advantage, mismatch stats) add under 0.5 s.</p>
+<div class="card">
+  <div id="stagelegend" class="legend"></div>
+  <div style="position:relative;height:300px"><canvas id="c_stage" role="img" aria-label="Stacked bars of time per stage split by kernel category and GPU idle time"></canvas></div>
+</div>
+<h3 id="gantttitle">Timeline of one step</h3>
+<p class="muted">Gantt chart of the traced step, from the CUPTI activity records. The upper lanes are the phases
+(blue: vLLM rollout engine, orange: FSDP trainer, gray: CPU only); the bottom lane is GPU kernel time per 5 ms bin,
+stacked by category, so a full-height column means the GPU was busy the whole bin. Drag across the chart to zoom,
+double-click or use the buttons to reset; hover for details. Training shows as forward/backward pairs, one per
+micro-batch, with an optimizer step at the end of each PPO mini-batch.</p>
+<div class="card">
+  <div id="ganttbtns" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px"></div>
+  <div id="ganttlegend" class="legend"></div>
+  <div style="position:relative"><canvas id="gantt" style="width:100%;display:block;cursor:crosshair"></canvas>
+    <div id="gtip" style="position:absolute;pointer-events:none;display:none;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;line-height:1.4;max-width:300px;white-space:nowrap"></div></div>
 </div>
 <h3>Phase totals averaged over all profiled steps</h3>
 <div class="tablewrap"><table id="phasetab"></table></div>
@@ -231,7 +256,152 @@ fetch("data/runs.json").then(r => r.json()).then(({ runs }) => {
   showRun(runs[0]);
 });
 
+
+// ---- stage breakdown and step timeline ----
+const CATG = [["GEMM", ["gemm", "gemm_quant"], "#2a78d6"], ["attention", ["attention"], "#eb6834"],
+  ["softmax / logprob", ["softmax_logprob"], "#1baf7a"], ["copy / cast", ["copy_cast"], "#eda100"],
+  ["elementwise / norm / reduce", ["elementwise", "norm", "reduce", "inductor_triton"], "#e87ba4"],
+  ["INT8 quantize", ["quantize"], "#6250d6"], ["memcpy / memset", ["memcpy"], "#8c6d4f"],
+  ["sampling, optimizer, other", ["sampling", "optimizer", "other"], "#008300"]];
+const IDLE = "#b4b2a9";
+const legendHTML = (items) => items.map(([n, c]) => `<span><i style="background:${c}"></i>${n}</span>`).join("");
+const STAGES = [["rollout", "Rollout (vLLM)"], ["old_logprob", "Old logprob (FSDP)"], ["train/forward", "Train forward"],
+  ["train/backward", "Train backward"], ["train/optimizer", "Optimizer"]];
+
+function stageChart(r) {
+  const prof = r.steps.filter(s => s.cupti && s.step >= 3);
+  const avg = (p, f) => mean(prof.filter(s => s.cupti[p]).map(s => f(s.cupti[p])));
+  const groups = CATG.filter(g => g[0] !== "memcpy / memset");
+  const datasets = groups.map(([n, cs, col]) => ({ label: n, backgroundColor: col, borderColor: css("--card"), borderWidth: { right: 1 }, borderSkipped: false,
+    barThickness: 22, data: STAGES.map(([p]) => avg(p, x => cs.reduce((a, c) => a + (x.c[c] || 0), 0))) }));
+  datasets.push({ label: "GPU idle", backgroundColor: IDLE, borderWidth: 0, barThickness: 22, data: STAGES.map(([p]) => Math.max(0, avg(p, x => x.w - x.b))) });
+  document.getElementById("stagelegend").innerHTML = legendHTML([...groups.map(g => [g[0], g[2]]), ["GPU idle (CPU, launch gaps)", IDLE]]);
+  if (charts.c_stage) charts.c_stage.destroy();
+  charts.c_stage = new Chart(document.getElementById("c_stage"), { type: "bar",
+    data: { labels: STAGES.map(([p, n]) => [n, `${fmt(avg(p, x => x.k), 0)} kernels`]), datasets },
+    options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmt(c.raw, 0)} ms`,
+        footer: it => { const p = STAGES[it[0].dataIndex][0], w = avg(p, x => x.w), b = avg(p, x => x.b);
+          return `stage ${fmt(w / 1000, 2)} s, GPU busy ${fmt(100 * b / w, 0)}%`; } } } },
+      scales: { x: { stacked: true, title: { display: true, text: "ms per step (average)" } }, y: { stacked: true } } } });
+}
+
+const LANES = [["weight sync", p => p.startsWith("weight_sync/") || p === "vllm_sleep", "v"], ["rollout", p => p === "rollout", "v"],
+  ["reward, advantage", p => p === "reward" || p === "advantage", "c"], ["old logprob", p => p === "old_logprob", "t"],
+  ["mismatch stats", p => p === "mismatch", "t"], ["train forward", p => p === "train/forward", "t"],
+  ["train backward", p => p === "train/backward", "t"], ["optimizer", p => p === "train/optimizer", "t"]];
+const LANECOL = { v: "#2a78d6", t: "#eb6834", c: "#888780" };
+const G = { tl: null, v0: 0, v1: 1, drag: null };
+
+function showTimeline(r) {
+  const box = document.getElementById("gantt").parentElement.parentElement;
+  if (r.timeline_step == null) { box.style.display = "none"; return; }
+  box.style.display = "";
+  fetch(`data/timeline_${r.name}.json`).then(x => x.json()).then(tl => {
+    tl.grp = CATG.map(([, cs]) => { const a = new Float64Array(tl.busy[0].length);
+      cs.forEach(c => { const i = tl.cats.indexOf(c); if (i >= 0) tl.busy[i].forEach((v, j) => a[j] += v); }); return a; });
+    G.tl = tl; G.v0 = 0; G.v1 = tl.end_ms;
+    document.getElementById("gantttitle").textContent = `Timeline of one step (step ${r.timeline_step}, ${fmt(tl.end_ms / 1000, 2)} s)`;
+    document.getElementById("ganttlegend").innerHTML = legendHTML([["vLLM phase", LANECOL.v], ["FSDP phase", LANECOL.t], ["CPU-only phase", LANECOL.c]])
+      + " &nbsp;GPU lane: " + legendHTML(CATG.map(g => [g[0], g[2]]));
+    const ph = n => tl.phases.find(p => p.n === n);
+    const presets = [["whole step", 0, tl.end_ms]];
+    const ro = ph("rollout"), ol = ph("old_logprob"), tr = ph("train");
+    if (ro) presets.push(["weight sync + rollout start", 0, Math.min(ro.t + 400, ro.t + ro.d)], ["rollout", ro.t, ro.t + ro.d]);
+    if (ol && tr) presets.push(["old logprob + train", ol.t, tr.t + tr.d]);
+    if (tr) { const f = tl.phases.filter(p => p.n === "train/optimizer")[0]; presets.push(["first PPO mini-batch", tr.t, f ? f.t + f.d + 5 : tr.t + tr.d]); }
+    const bb = document.getElementById("ganttbtns"); bb.innerHTML = "";
+    presets.forEach(([n, a, b], i) => { const e = document.createElement("button"); e.textContent = n;
+      e.onclick = () => { G.v0 = a; G.v1 = b; [...bb.children].forEach(x => x.classList.remove("on")); e.classList.add("on"); drawGantt(); };
+      if (!i) e.classList.add("on"); bb.appendChild(e); });
+    drawGantt();
+  });
+}
+
+const GL = { left: 118, laneH: 20, gap: 4, gpuH: 70, axis: 22 };
+function drawGantt() {
+  const tl = G.tl; if (!tl) return;
+  const cv = document.getElementById("gantt"), dpr = window.devicePixelRatio || 1;
+  const W = cv.parentElement.clientWidth, H = LANES.length * (GL.laneH + GL.gap) + GL.gpuH + GL.axis + 10;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.height = H + "px";
+  const x = cv.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, W, H);
+  const pw = W - GL.left - 8, tx = t => GL.left + (t - G.v0) / (G.v1 - G.v0) * pw;
+  x.font = "12px -apple-system, Segoe UI, Roboto, sans-serif"; x.textBaseline = "middle";
+  const fg = css("--fg"), muted = css("--muted"), line = css("--line");
+  LANES.forEach(([name, test, kind], i) => {
+    const y = i * (GL.laneH + GL.gap);
+    x.fillStyle = muted; x.fillText(name, 4, y + GL.laneH / 2);
+    x.strokeStyle = line; x.beginPath(); x.moveTo(GL.left, y + GL.laneH + GL.gap / 2); x.lineTo(W - 8, y + GL.laneH + GL.gap / 2); x.stroke();
+    x.fillStyle = LANECOL[kind];
+    for (const p of tl.phases) if (test(p.n)) {
+      const a = Math.max(tx(p.t), GL.left), b = Math.min(tx(p.t + p.d), W - 8);
+      if (b < GL.left || a > W - 8) continue;
+      x.fillRect(a, y + 2, Math.max(1, b - a), GL.laneH - 4);
+    }
+  });
+  const gy = LANES.length * (GL.laneH + GL.gap) + 4;
+  x.fillStyle = muted; x.fillText("GPU kernels", 4, gy + GL.gpuH / 2);
+  x.fillStyle = css("--code"); x.fillRect(GL.left, gy, pw, GL.gpuH);
+  const bm = tl.bin_ms, n = tl.grp[0].length;
+  for (let px = 0; px < pw; px++) {
+    const t0 = G.v0 + px / pw * (G.v1 - G.v0), t1 = G.v0 + (px + 1) / pw * (G.v1 - G.v0);
+    const b0 = Math.max(0, Math.floor(t0 / bm)), b1 = Math.min(n - 1, Math.max(b0, Math.ceil(t1 / bm) - 1));
+    const span = (b1 - b0 + 1) * bm; let yy = gy + GL.gpuH;
+    tl.grp.forEach((a, gi) => { let s = 0; for (let b = b0; b <= b1; b++) s += a[b];
+      const h = Math.min(1, s / span) * GL.gpuH; if (h > 0) { x.fillStyle = CATG[gi][2]; x.fillRect(GL.left + px, yy - h, 1.02, h); yy -= h; } });
+  }
+  const ay = gy + GL.gpuH + 4, span = G.v1 - G.v0;
+  const step = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000].find(s => span / s <= 10) || 10000;
+  x.fillStyle = muted; x.textBaseline = "top";
+  for (let t = Math.ceil(G.v0 / step) * step; t <= G.v1; t += step) {
+    const xx = tx(t); x.fillRect(xx, ay, 1, 4);
+    const lab = step >= 1000 ? `${t / 1000} s` : `${t} ms`, lw = x.measureText(lab).width;
+    x.fillText(lab, Math.min(Math.max(xx - lw / 2, GL.left), W - 8 - lw), ay + 6);
+  }
+  if (G.drag && G.drag.x1 != null) { x.fillStyle = "rgba(42,120,214,0.15)";
+    x.fillRect(Math.min(G.drag.x0, G.drag.x1), 0, Math.abs(G.drag.x1 - G.drag.x0), gy + GL.gpuH); }
+}
+
+(function ganttEvents() {
+  const cv = document.getElementById("gantt"), tip = document.getElementById("gtip");
+  const tAt = px => { const pw = cv.clientWidth - GL.left - 8; return G.v0 + (px - GL.left) / pw * (G.v1 - G.v0); };
+  const busyIn = (a, b) => { const tl = G.tl, bm = tl.bin_ms, b0 = Math.max(0, Math.floor(a / bm)), b1 = Math.min(tl.grp[0].length - 1, Math.floor(b / bm));
+    return tl.grp.map(g => { let s = 0; for (let i = b0; i <= b1; i++) s += g[i]; return s; }); };
+  cv.addEventListener("mousedown", e => { if (e.offsetX > GL.left) G.drag = { x0: e.offsetX, x1: null }; });
+  cv.addEventListener("mousemove", e => {
+    if (!G.tl) return;
+    if (G.drag) { G.drag.x1 = e.offsetX; drawGantt(); }
+    const t = tAt(e.offsetX), lane = Math.floor(e.offsetY / (GL.laneH + GL.gap));
+    let h = "";
+    if (e.offsetX > GL.left && lane < LANES.length) {
+      const p = G.tl.phases.find(p => LANES[lane][1](p.n) && p.t <= t && t <= p.t + p.d);
+      if (p) { const bs = busyIn(p.t, p.t + p.d), tot = bs.reduce((a, c) => a + c, 0);
+        h = `<b>${p.n}</b><br>start ${fmt(p.t, 1)} ms, length ${fmt(p.d, 1)} ms<br>GPU busy ${fmt(Math.min(100, 100 * tot / p.d), 0)}%`; }
+    } else if (e.offsetX > GL.left) {
+      const w = (G.v1 - G.v0) / (cv.clientWidth - GL.left - 8) * 4, bs = busyIn(t - w, t + w);
+      const parts = CATG.map((g, i) => [g[0], bs[i]]).filter(v => v[1] > 0.01).sort((a, b) => b[1] - a[1]);
+      h = `<b>${fmt(t, 0)} ms</b><br>` + (parts.length ? parts.map(([n, v]) => `${n}: ${fmt(v, 2)} ms`).join("<br>") : "GPU idle");
+    }
+    if (h) { tip.innerHTML = h; tip.style.display = "block";
+      const left = Math.min(e.offsetX + 12, cv.clientWidth - tip.offsetWidth - 4); tip.style.left = left + "px"; tip.style.top = (e.offsetY + 12) + "px"; }
+    else tip.style.display = "none";
+  });
+  cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  window.addEventListener("mouseup", () => {
+    if (!G.drag) return;
+    const d = G.drag; G.drag = null;
+    if (d.x1 != null && Math.abs(d.x1 - d.x0) > 4) { const a = tAt(Math.min(d.x0, d.x1)), b = tAt(Math.max(d.x0, d.x1));
+      G.v0 = Math.max(0, a); G.v1 = Math.min(G.tl.end_ms, b); [...document.getElementById("ganttbtns").children].forEach(x => x.classList.remove("on")); }
+    drawGantt();
+  });
+  cv.addEventListener("dblclick", () => { if (!G.tl) return; G.v0 = 0; G.v1 = G.tl.end_ms; const bb = document.getElementById("ganttbtns").children;
+    [...bb].forEach((x, i) => x.classList.toggle("on", i === 0)); drawGantt(); });
+  window.addEventListener("resize", drawGantt);
+})();
+
 function showRun(r) {
+  stageChart(r);
+  showTimeline(r);
   const prof = r.steps.filter(s => s.cupti);
   const present = PHASES.filter(p => prof.some(s => s.cupti[p]));
   chart("c_phase", present.map((p, i) => ({ label: p, borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i % COLORS.length],
